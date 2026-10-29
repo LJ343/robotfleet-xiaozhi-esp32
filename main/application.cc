@@ -708,10 +708,9 @@ void Application::InitializeProtocol() {
             if (cJSON_IsObject(payload)) {
                 CJsonStringUniquePtr payload_json(cJSON_PrintUnformatted(payload));
                 if (payload_json) {
-                    Schedule(
-                        [this, display, payload_str = std::string(payload_json.get())]() {
-                            display->SetChatMessage("system", payload_str.c_str());
-                        });
+                    Schedule([this, display, payload_str = std::string(payload_json.get())]() {
+                        display->SetChatMessage("system", payload_str.c_str());
+                    });
                 }
             } else {
                 ESP_LOGW(TAG, "Invalid custom message format: missing payload");
@@ -723,6 +722,57 @@ void Application::InitializeProtocol() {
     });
 
     protocol_->Start();
+    if (ota_->HasWebsocketConfig()) {
+        notification_channel_ = std::make_unique<NotificationChannel>(
+            [this](std::string id, std::string phase, std::string url, std::string text) {
+                Schedule([this, id = std::move(id), phase = std::move(phase), url = std::move(url),
+                          text = std::move(text)]() {
+                    if (!notification_channel_ || !notification_channel_->IsCurrent(id)) {
+                        return;
+                    }
+                    if (phase == "prepare") {
+                        // A disconnected or expired reservation must not block the next hint.
+                        if (GetDeviceState() == kDeviceStateIdle && !web_notice_id_.empty() &&
+                            !notification_channel_->IsCurrent(web_notice_id_)) {
+                            web_notice_id_.clear();
+                            web_notice_url_.clear();
+                            web_notice_text_.clear();
+                        }
+                        if (GetDeviceState() != kDeviceStateIdle || notify_player_.IsBusy() ||
+                            !web_notice_id_.empty()) {
+                            notification_channel_->Reply(id, "busy");
+                            return;
+                        }
+                        web_notice_id_ = id;
+                        web_notice_url_ = url;
+                        web_notice_text_ = text;
+                        notification_channel_->Reply(id, "ready");
+                    } else if (web_notice_id_ == id && phase == "play") {
+                        if (GetDeviceState() == kDeviceStateIdle && !notify_player_.IsBusy()) {
+                            StartNotification(web_notice_url_, {{0, web_notice_text_}});
+                            if (GetDeviceState() == kDeviceStateNotifying) {
+                                notification_channel_->Reply(id, "playing");
+                                return;
+                            }
+                        }
+                        notification_channel_->Reply(id, "cancelled");
+                        web_notice_id_.clear();
+                        web_notice_url_.clear();
+                        web_notice_text_.clear();
+                    } else if (web_notice_id_ == id && phase == "cancel") {
+                        if (GetDeviceState() == kDeviceStateNotifying) {
+                            StopNotification();
+                        } else {
+                            notification_channel_->Reply(id, "cancelled");
+                            web_notice_id_.clear();
+                            web_notice_url_.clear();
+                            web_notice_text_.clear();
+                        }
+                    }
+                });
+            });
+        notification_channel_->Start();
+    }
 }
 
 void Application::ShowActivationCode(const std::string& code, const std::string& message) {
@@ -994,6 +1044,9 @@ void Application::ContinueWakeWordInvoke(const std::string& wake_word) {
 
 void Application::HandleStateChangedEvent() {
     DeviceState new_state = state_machine_.GetState();
+    if (notification_channel_) {
+        notification_channel_->SetState(new_state);
+    }
     clock_ticks_ = 0;
     // Any state change invalidates a pending deferred listening start;
     // the Listening case below re-arms it when needed.
@@ -1145,6 +1198,14 @@ void Application::StartNotification(std::string audio_url, std::vector<NotifySub
 }
 
 void Application::StopNotification() {
+    if (!web_notice_id_.empty()) {
+        if (notification_channel_) {
+            notification_channel_->Reply(web_notice_id_, "cancelled");
+        }
+        web_notice_id_.clear();
+        web_notice_url_.clear();
+        web_notice_text_.clear();
+    }
     notify_player_.Stop();
     audio_service_.ResetDecoder();
     auto& board = Board::GetInstance();
@@ -1161,6 +1222,12 @@ void Application::HandleNotificationFinished(uint32_t playback_id, bool success)
     }
     ESP_LOGI(TAG, "Notification playback %lu %s", static_cast<unsigned long>(playback_id),
              success ? "completed" : "failed");
+    if (!web_notice_id_.empty() && notification_channel_) {
+        notification_channel_->Reply(web_notice_id_, success ? "completed" : "failed");
+        web_notice_id_.clear();
+        web_notice_url_.clear();
+        web_notice_text_.clear();
+    }
     StopNotification();
 }
 
@@ -1198,6 +1265,8 @@ void Application::Reboot() {
     if (protocol_ && protocol_->IsAudioChannelOpened()) {
         protocol_->CloseAudioChannel();
     }
+    notification_channel_.reset();
+    web_notice_id_.clear();
     protocol_.reset();
     audio_service_.Stop();
 
@@ -1369,6 +1438,8 @@ void Application::ResetProtocol() {
             protocol_->CloseAudioChannel();
         }
         // Reset protocol
+        notification_channel_.reset();
+        web_notice_id_.clear();
         protocol_.reset();
     });
 }
