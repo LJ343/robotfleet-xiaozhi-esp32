@@ -192,6 +192,8 @@ void Application::Run() {
                 StopNotification();
             }
             SetDeviceState(kDeviceStateIdle);
+            display_activity_.OnError();
+            RefreshDisplayActivity();
             Alert(Lang::Strings::ERROR, last_error_message_.c_str(), "cancel",
                   Lang::Sounds::OGG_EXCLAMATION);
         }
@@ -223,6 +225,7 @@ void Application::Run() {
                 pending_listening_start_ = false;
                 StartListeningAudio();
             }
+            RefreshDisplayActivity();
         }
 
         if (bits & MAIN_EVENT_TOGGLE_CHAT) {
@@ -259,6 +262,10 @@ void Application::Run() {
             if (GetDeviceState() == kDeviceStateListening) {
                 auto led = Board::GetInstance().GetLed();
                 led->OnStateChanged();
+                if (audio_service_.IsVoiceDetected()) {
+                    display_activity_.OnUserSpeech();
+                    RefreshDisplayActivity();
+                }
             }
         }
 
@@ -276,6 +283,12 @@ void Application::Run() {
             auto display = Board::GetInstance().GetDisplay();
             display->UpdateStatusBar();
 
+            // A streaming notice can refill after a temporary playback gap.
+            // Refresh its illustration without adding work to the audio path.
+            if (GetDeviceState() == kDeviceStateSpeaking) {
+                RefreshDisplayActivity();
+            }
+
             // Print debug info every 10 seconds
             if (clock_ticks_ % 10 == 0) {
                 SystemInfo::PrintHeapStats();
@@ -287,6 +300,8 @@ void Application::Run() {
 }
 
 void Application::HandleNetworkConnectedEvent() {
+    display_activity_.OnNetwork(true);
+    RefreshDisplayActivity();
     ESP_LOGI(TAG, "Network connected");
     auto state = GetDeviceState();
 
@@ -314,6 +329,8 @@ void Application::HandleNetworkConnectedEvent() {
 }
 
 void Application::HandleNetworkDisconnectedEvent() {
+    display_activity_.OnNetwork(false);
+    RefreshDisplayActivity();
     // Close current conversation when network disconnected
     auto state = GetDeviceState();
     if (state == kDeviceStateNotifying) {
@@ -572,7 +589,9 @@ void Application::InitializeProtocol() {
         Schedule([this]() {
             auto display = Board::GetInstance().GetDisplay();
             display->SetChatMessage("system", "");
+            display_activity_.OnChannelClosed();
             SetDeviceState(kDeviceStateIdle);
+            RefreshDisplayActivity();
         });
     });
 
@@ -624,10 +643,13 @@ void Application::InitializeProtocol() {
             if (strcmp(state->valuestring, "start") == 0) {
                 Schedule([this]() {
                     aborted_ = false;
+                    display_activity_.OnTtsStart();
                     SetDeviceState(kDeviceStateSpeaking);
+                    RefreshDisplayActivity();
                 });
             } else if (strcmp(state->valuestring, "stop") == 0) {
                 Schedule([this]() {
+                    display_activity_.OnTtsStop();
                     if (GetDeviceState() == kDeviceStateSpeaking) {
                         if (listening_mode_ == kListeningModeManualStop) {
                             SetDeviceState(kDeviceStateIdle);
@@ -635,6 +657,7 @@ void Application::InitializeProtocol() {
                             SetDeviceState(kDeviceStateListening);
                         }
                     }
+                    RefreshDisplayActivity();
                 });
             } else if (strcmp(state->valuestring, "sentence_start") == 0) {
                 auto text = cJSON_GetObjectItem(root, "text");
@@ -645,8 +668,10 @@ void Application::InitializeProtocol() {
                         glyphs.clear();
                     }
                     ESP_LOGI(TAG, "<< %s", text->valuestring);
-                    Schedule([display, message = std::string(text->valuestring),
+                    Schedule([this, display, message = std::string(text->valuestring),
                               glyphs = std::move(glyphs), bpp]() {
+                        display_activity_.OnAssistantSentence(message);
+                        RefreshDisplayActivity();
                         display->AddTextGlyphs(glyphs, bpp);
                         display->SetChatMessage("assistant", message.c_str());
                     });
@@ -661,8 +686,10 @@ void Application::InitializeProtocol() {
                     glyphs.clear();
                 }
                 ESP_LOGI(TAG, ">> %s", text->valuestring);
-                Schedule([display, message = std::string(text->valuestring),
+                Schedule([this, display, message = std::string(text->valuestring),
                           glyphs = std::move(glyphs), bpp]() {
+                    display_activity_.OnRecognizedText(!message.empty());
+                    RefreshDisplayActivity();
                     display->AddTextGlyphs(glyphs, bpp);
                     display->SetChatMessage("user", message.c_str());
                 });
@@ -1119,6 +1146,20 @@ void Application::HandleStateChangedEvent() {
             // Do nothing
             break;
     }
+    RefreshDisplayActivity();
+}
+
+void Application::RefreshDisplayActivity() {
+    display_activity_.OnState(GetDeviceState());
+    const bool playback_idle = audio_service_.IsPlaybackIdle();
+    auto activity = display_activity_.activity(playback_idle);
+    // STOP can precede the actual end of the local playback queue. Keep the
+    // playback indicator until the existing deferred-listening path drains it.
+    if ((GetDeviceState() == kDeviceStateListening || GetDeviceState() == kDeviceStateIdle) &&
+        !playback_idle && activity != DisplayActivity::Offline) {
+        activity = DisplayActivity::Speaking;
+    }
+    Board::GetInstance().GetDisplay()->SetActivity(activity);
 }
 
 void Application::StartListeningAudio() {
@@ -1133,6 +1174,7 @@ void Application::StartListeningAudio() {
     audio_service_.EnableVoiceProcessing(true);
 
     ConfigureWakeWordForListening();
+    RefreshDisplayActivity();
 
     // Play popup sound after ResetDecoder (in EnableVoiceProcessing) has been called
     if (play_popup_on_listening_) {
@@ -1241,6 +1283,8 @@ void Application::Schedule(std::function<void()>&& callback) {
 
 void Application::AbortSpeaking(AbortReason reason) {
     ESP_LOGI(TAG, "Abort speaking");
+    display_activity_.OnInterrupt();
+    RefreshDisplayActivity();
     aborted_ = true;
     if (protocol_) {
         protocol_->SendAbortSpeaking(reason);

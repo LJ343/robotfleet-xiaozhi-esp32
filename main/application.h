@@ -17,6 +17,7 @@
 #include "audio_service.h"
 #include "device_state.h"
 #include "device_state_machine.h"
+#include "display/display_activity.h"
 #include "notify/notification_channel.h"
 #include "notify/notify_player.h"
 #include "ota.h"
@@ -158,6 +159,7 @@ private:
         false;  // Flag to play popup sound after state changes to listening
     bool pending_listening_start_ =
         false;  // Waiting for playback to drain before starting listening (auto mode)
+    DisplayActivityState display_activity_;
     int clock_ticks_ = 0;
     TaskHandle_t activation_task_handle_ = nullptr;
 
@@ -175,6 +177,7 @@ private:
     void ContinueWakeWordInvoke(const std::string& wake_word);
     void StartListeningAudio();
     void ConfigureWakeWordForListening();
+    void RefreshDisplayActivity();
     void StartNotification(std::string audio_url, std::vector<NotifySubtitle> subtitles);
     void StopNotification();
     void HandleNotificationFinished(uint32_t playback_id, bool success);

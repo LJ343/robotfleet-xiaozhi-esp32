@@ -1,6 +1,7 @@
 #ifndef DISPLAY_H
 #define DISPLAY_H
 
+#include "display_activity.h"
 #include "emoji_collection.h"
 #include "text_glyph.h"
 
@@ -44,6 +45,7 @@ public:
     virtual void ShowNotification(const char* notification, int duration_ms = 3000);
     virtual void ShowNotification(const std::string& notification, int duration_ms = 3000);
     virtual void SetEmotion(const char* emotion);
+    virtual void SetActivity(DisplayActivity activity) { (void)activity; }
     virtual void SetChatMessage(const char* role, const char* content);
     virtual void ClearChatMessages();
     virtual void SetTheme(Theme* theme);
